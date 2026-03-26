@@ -829,6 +829,7 @@ fn init_tracing_stderr() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(config_log_level())),
         )
+        .with_writer(std::io::stderr)
         .init();
 }
 
@@ -869,7 +870,23 @@ fn init_tracing_file() {
     }
 }
 
+/// Write `msg` to stdout, silently exiting with code 0 on BrokenPipe.
+/// Use this instead of `println!` for machine-readable (JSON) output that is
+/// commonly piped into other tools.
+fn write_stdout_safe(msg: &str) {
+    let out = std::io::stdout();
+    let mut lock = out.lock();
+    if let Err(e) = writeln!(lock, "{}", msg) {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        eprintln!("error: failed writing to stdout: {e}");
+        std::process::exit(1);
+    }
+}
+
 fn main() {
+
     // Load ~/.openfang/.env into process environment (system env takes priority).
     dotenv::load_dotenv();
 
@@ -2414,11 +2431,14 @@ decay_rate = 0.05
                 if !json {
                     ui::provider_status(name, env_var, true);
                 }
-            } else if !json {
-                ui::check_warn(&format!("{name} ({env_var}) - key rejected (401/403)"));
+            } else {
+                if !json {
+                    ui::check_fail(&format!("{name} ({env_var}) - key rejected (401/403)"));
+                }
+                all_ok = false;
             }
             any_key_set = true;
-            checks.push(serde_json::json!({"check": "provider", "name": name, "env_var": env_var, "status": if valid { "ok" } else { "warn" }, "live_test": !valid}));
+            checks.push(serde_json::json!({"check": "provider", "name": name, "env_var": env_var, "status": if valid { "ok" } else { "fail" }, "live_test": !valid}));
         } else {
             if !json {
                 ui::provider_status(name, env_var, false);
@@ -2909,19 +2929,20 @@ decay_rate = 0.05
     }
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+        write_stdout_safe(
+            &serde_json::to_string_pretty(&serde_json::json!({
                 "all_ok": all_ok,
                 "checks": checks,
             }))
-            .unwrap_or_default()
+            .unwrap_or_default(),
         );
     } else {
         println!();
         if all_ok {
             ui::success("All checks passed! OpenFang is ready.");
-            ui::hint("Start the daemon: openfang start");
+            if find_daemon().is_none() {
+                ui::hint("Start the daemon: openfang start");
+            }
         } else if repaired {
             ui::success("Repairs applied. Re-run `openfang doctor` to verify.");
         } else {
