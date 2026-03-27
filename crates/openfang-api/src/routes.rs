@@ -1,7 +1,7 @@
 //! Route handlers for the OpenFang API.
 
 use crate::types::*;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -40,6 +40,9 @@ pub struct AppState {
     /// Avoids blocking the `/api/providers` endpoint on TCP timeouts to
     /// unreachable local services. 60-second TTL.
     pub provider_probe_cache: openfang_runtime::provider_health::ProbeCache,
+    /// Thread-safe mutable budget config. Updated via PUT /api/budget.
+    /// Initialized from `kernel.config.budget` at startup.
+    pub budget_config: Arc<tokio::sync::RwLock<openfang_types::config::BudgetConfig>>,
 }
 
 /// POST /api/agents — Spawn a new agent.
@@ -3104,15 +3107,21 @@ pub async fn list_templates() -> impl IntoResponse {
                         .to_string_lossy()
                         .to_string();
 
-                    let description = std::fs::read_to_string(&manifest_path)
-                        .ok()
+                    let manifest_content = std::fs::read_to_string(&manifest_path).ok();
+                    let description = manifest_content
+                        .as_ref()
                         .and_then(|content| toml::from_str::<AgentManifest>(&content).ok())
                         .map(|m| m.description)
                         .unwrap_or_default();
 
+                    // Add category based on template name
+                    let category = get_template_category(&name);
+
                     templates.push(serde_json::json!({
                         "name": name,
                         "description": description,
+                        "category": category,
+                        "manifest_toml": manifest_content.unwrap_or_default(),
                     }));
                 }
             }
@@ -3123,6 +3132,24 @@ pub async fn list_templates() -> impl IntoResponse {
         "templates": templates,
         "total": templates.len(),
     }))
+}
+
+fn get_template_category(name: &str) -> &str {
+    match name {
+        "hello-world" | "assistant" => "General",
+        "researcher" | "analyst" => "Research",
+        "coder" | "debugger" | "devops-lead" => "Development",
+        "writer" | "doc-writer" => "Writing",
+        "ops" | "planner" => "Operations",
+        "architect" | "security-auditor" => "Development",
+        "code-reviewer" | "data-scientist" | "test-engineer" => "Development",
+        "legal-assistant" | "email-assistant" | "social-media" => "Business",
+        "customer-support" | "sales-assistant" | "recruiter" => "Business",
+        "meeting-assistant" => "Business",
+        "translator" | "tutor" | "health-tracker" => "General",
+        "personal-finance" | "travel-planner" | "home-automation" => "General",
+        _ => "General",
+    }
 }
 
 /// GET /api/templates/:name — Get template details.
@@ -5266,10 +5293,8 @@ pub async fn usage_daily(State(state): State<Arc<AppState>>) -> impl IntoRespons
 
 /// GET /api/budget — Current budget status (limits, spend, % used).
 pub async fn budget_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let status = state
-        .kernel
-        .metering
-        .budget_status(&state.kernel.config.budget);
+    let budget = state.budget_config.read().await;
+    let status = state.kernel.metering.budget_status(&budget);
     Json(serde_json::to_value(&status).unwrap_or_default())
 }
 
@@ -5278,34 +5303,26 @@ pub async fn update_budget(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    // SAFETY: Budget config is updated in-place. Since KernelConfig is behind
-    // an Arc and we only have &self, we use ptr mutation (same pattern as OFP).
-    let config_ptr = &state.kernel.config as *const openfang_types::config::KernelConfig
-        as *mut openfang_types::config::KernelConfig;
-
-    // Apply updates
-    unsafe {
+    {
+        let mut budget = state.budget_config.write().await;
         if let Some(v) = body["max_hourly_usd"].as_f64() {
-            (*config_ptr).budget.max_hourly_usd = v;
+            budget.max_hourly_usd = v;
         }
         if let Some(v) = body["max_daily_usd"].as_f64() {
-            (*config_ptr).budget.max_daily_usd = v;
+            budget.max_daily_usd = v;
         }
         if let Some(v) = body["max_monthly_usd"].as_f64() {
-            (*config_ptr).budget.max_monthly_usd = v;
+            budget.max_monthly_usd = v;
         }
         if let Some(v) = body["alert_threshold"].as_f64() {
-            (*config_ptr).budget.alert_threshold = v.clamp(0.0, 1.0);
+            budget.alert_threshold = v.clamp(0.0, 1.0);
         }
         if let Some(v) = body["default_max_llm_tokens_per_hour"].as_u64() {
-            (*config_ptr).budget.default_max_llm_tokens_per_hour = v;
+            budget.default_max_llm_tokens_per_hour = v;
         }
     }
-
-    let status = state
-        .kernel
-        .metering
-        .budget_status(&state.kernel.config.budget);
+    let budget = state.budget_config.read().await;
+    let status = state.kernel.metering.budget_status(&budget);
     Json(serde_json::to_value(&status).unwrap_or_default())
 }
 
@@ -9319,16 +9336,14 @@ fn is_allowed_content_type(ct: &str) -> bool {
 
 /// POST /api/agents/{id}/upload — Upload a file attachment.
 ///
-/// Accepts raw body bytes. The client must set:
-/// - `Content-Type` header (e.g., `image/png`, `text/plain`, `application/pdf`)
-/// - `X-Filename` header (original filename)
+/// Accepts multipart/form-data. The client must include a file field with:
+/// - `Content-Type` field (e.g., `image/png`, `text/plain`, `application/pdf`)
+/// - `filename` attribute (original filename)
 pub async fn upload_file(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    mut multipart: Multipart,
 ) -> impl IntoResponse {
-    // Validate agent ID format
     let _agent_id: AgentId = match id.parse() {
         Ok(id) => id,
         Err(_) => {
@@ -9339,12 +9354,62 @@ pub async fn upload_file(
         }
     };
 
-    // Extract content type
-    let content_type = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
+    let mut file_data: Option<(Option<String>, String, axum::body::Bytes)> = None;
+    let mut filename_from_field: Option<String> = None;
+
+    while let Some(field) = multipart.next_field().await.transpose() {
+        let field = match field {
+            Ok(f) => f,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": format!("Failed to read field: {}", e)})),
+                );
+            }
+        };
+
+        let field_name = field.name().unwrap_or("").to_string();
+
+        match field_name.as_str() {
+            "file" => {
+                let filename_attr = field.file_name().map(|s| s.to_string());
+                let content_type = field
+                    .content_type()
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+                let bytes = match field.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(
+                                serde_json::json!({"error": format!("Failed to read file: {}", e)}),
+                            ),
+                        );
+                    }
+                };
+                file_data = Some((filename_attr, content_type, bytes));
+            }
+            "filename" => {
+                filename_from_field = field.text().await.ok();
+            }
+            _ => {}
+        }
+    }
+
+    let (filename_attr, content_type, body) = match file_data {
+        Some(data) => data,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "No file provided"})),
+            );
+        }
+    };
+
+    let filename = filename_from_field
+        .or(filename_attr)
+        .unwrap_or_else(|| "upload".to_string());
 
     if !is_allowed_content_type(&content_type) {
         return (
@@ -9354,13 +9419,6 @@ pub async fn upload_file(
             ),
         );
     }
-
-    // Extract filename from header
-    let filename = headers
-        .get("X-Filename")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("upload")
-        .to_string();
 
     // Validate size
     if body.len() > MAX_UPLOAD_SIZE {
