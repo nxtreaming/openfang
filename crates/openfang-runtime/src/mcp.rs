@@ -307,8 +307,7 @@ impl McpConnection {
             }
         }
 
-        let mut config = StreamableHttpClientTransportConfig::default();
-        config.uri = Arc::from(url);
+        let mut config = StreamableHttpClientTransportConfig::with_uri(Arc::from(url));
         config.custom_headers = custom_headers;
 
         let transport = StreamableHttpClientTransport::from_config(config);
