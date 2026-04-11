@@ -484,9 +484,7 @@ pub async fn get_agent_session(
             let filtered_messages: Vec<&openfang_types::message::Message> = session
                 .messages
                 .iter()
-                .filter(|m| {
-                    include_system || m.role != openfang_types::message::Role::System
-                })
+                .filter(|m| include_system || m.role != openfang_types::message::Role::System)
                 .collect();
 
             // Two-pass approach: ToolUse blocks live in Assistant messages while
@@ -5849,6 +5847,11 @@ pub async fn patch_agent(
     // Persist updated entry to SQLite
     if let Some(entry) = state.kernel.registry.get(agent_id) {
         let _ = state.kernel.memory.save_agent(&entry);
+
+        // Write updated manifest to agent.toml on disk so disk doesn't override
+        // dashboard changes on next boot (#996, #1018).
+        state.kernel.persist_manifest_to_disk(agent_id);
+
         (
             StatusCode::OK,
             Json(
@@ -8993,6 +8996,10 @@ pub async fn patch_agent_config(
             tracing::warn!("Failed to persist agent config update: {e}");
         }
     }
+
+    // Write updated manifest to agent.toml on disk so disk doesn't override
+    // dashboard changes on next boot (#996, #1018).
+    state.kernel.persist_manifest_to_disk(agent_id);
 
     (
         StatusCode::OK,
